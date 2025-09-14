@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AI Video Generator — Client-side</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;margin:18px;}
+    .row{display:flex;gap:8px;align-items:center}
+    label{font-weight:600}
+    textarea{width:100%;height:120px}
+    input,select,button{padding:8px;border-radius:6px;border:1px solid #ddd}
+    #canvas{background:#111;color:#fff;display:block;margin:12px 0;border-radius:8px}
+    .muted{color:#666;font-size:13px}
+  </style>
+</head>
+<body>
+  <h1>AI Video Generator — Client-side (embeddable)</h1>
+  <p class="muted">Creates short videos from text & images entirely in the browser — no server required. Works well on modern desktop browsers.</p>
+
+  <label for="script">Video script (one slide per line):</label>
+  <textarea id="script" placeholder="Write each slide text on a new line\nExample:\nWelcome to my blog\nTip 1: Write great titles\nThanks for watching"></textarea>
+
+  <div class="row">
+    <div>
+      <label for="duration">Slide duration (seconds):</label>
+      <input id="duration" type="number" value="3" min="1" style="width:90px" />
+    </div>
+    <div>
+      <label for="width">Video size:</label>
+      <select id="width">
+        <option value="1280x720">1280×720 (16:9)</option>
+        <option value="720x1280">720×1280 (Vertical)</option>
+        <option value="640x480">640×480 (4:3)</option>
+      </select>
+    </div>
+    <div>
+      <label for="fps">FPS:</label>
+      <input id="fps" type="number" value="25" min="10" max="60" style="width:70px" />
+    </div>
+  </div>
+
+  <div style="margin-top:10px">
+    <label>Optional: upload images (one per slide). If not provided, text-only slides will be used.</label>
+    <input id="images" type="file" accept="image/*" multiple />
+  </div>
+
+  <div style="margin-top:12px" class="row">
+    <button id="generate">Generate Video (record canvas)</button>
+    <button id="preview">Preview Slides</button>
+    <button id="stop" disabled>Stop</button>
+  </div>
+
+  <canvas id="canvas" width="1280" height="720"></canvas>
+  <div id="status" class="muted">Ready.</div>
+  <div id="download" style="margin-top:12px"></div>
+
+  <hr />
+  <h3>Embed in Blogspot</h3>
+  <p class="muted">Host this HTML on Netlify (or any static host) and embed with an iframe in your Blogspot post/page:</p>
+  <pre>&lt;iframe src="https://your-site.netlify.app" width="100%" height="600" style="border:none;overflow:hidden"&gt;&lt;/iframe&gt;</pre>
+  <p class="muted">See bottom of this file for quick hosting steps.</p>
+
+  <script>
+  // --- Utilities ---
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const status = document.getElementById('status');
+  const downloadDiv = document.getElementById('download');
+
+  function setStatus(s){ status.textContent = s; }
+
+  // Draw a single slide: background, optional image, and centered text.
+  async function drawSlide(text, img, size){
+    const [w,h] = size;
+    // background
+    ctx.fillStyle = '#0f1720';
+    ctx.fillRect(0,0,w,h);
+    // image if present: draw left half or cover
+    if(img){
+      // fit image preserving aspect
+      const ratio = Math.min(w*0.6 / img.width, h*0.9 / img.height);
+      const iw = img.width*ratio; const ih = img.height*ratio;
+      ctx.drawImage(img, w - iw - 40, (h-ih)/2, iw, ih);
+    }
+    // text box
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(40, h*0.12, w*0.52, h*0.76);
+    // text
+    ctx.fillStyle = '#fff';
+    ctx.font = Math.floor(h*0.06) + 'px sans-serif';
+    ctx.textAlign = 'left';
+    wrapText(ctx, text, 60, h*0.2, w*0.5 - 80, Math.floor(h*0.07));
+  }
+
+  function wrapText(ctx, text, x, y, maxWidth, lineHeight){
+    const words = text.split(/\s+/);
+    let line = '';
+    for(let n=0;n<words.length;n++){
+      const test = line + words[n] + ' ';
+      const metrics = ctx.measureText(test);
+      if(metrics.width > maxWidth && n>0){
+        ctx.fillText(line, x, y);
+        line = words[n] + ' ';
+        y += lineHeight;
+      } else {
+        line = test;
+      }
+    }
+    ctx.fillText(line, x, y);
+  }
+
+  // Converts File -> HTMLImageElement
+  function fileToImage(file){
+    return new Promise((res,rej)=>{
+      const img = new Image();
+      img.onload = ()=>res(img);
+      img.onerror = rej;
+      img.src = URL.createObjectURL(file);
+    });
+  }
+
+  // Main recorder logic: uses MediaRecorder on canvas.captureStream
+  document.getElementById('generate').addEventListener('click', async ()=>{
+    setStatus('Preparing...');
+    downloadDiv.innerHTML = '';
+    const lines = document.getElementById('script').value.split('\n').map(s=>s.trim()).filter(Boolean);
+    if(lines.length===0){ setStatus('Please enter at least one slide (one line per slide).'); return; }
+    const duration = Number(document.getElementById('duration').value) || 3;
+    const fps = Number(document.getElementById('fps').value) || 25;
+    const sizeSel = document.getElementById('width').value.split('x').map(Number);
+    canvas.width = sizeSel[0]; canvas.height = sizeSel[1];
+
+    // load uploaded images (may be fewer than slides)
+    const files = document.getElementById('images').files;
+    const images = [];
+    for(let i=0;i<files.length;i++){
+      try{ images.push(await fileToImage(files[i])); } catch(e){ console.warn('image load failed', e); }
+    }
+
+    // TTS: generate speech for whole script or per slide.
+    const utterances = [];
+    for(const line of lines){
+      utterances.push(new SpeechSynthesisUtterance(line));
+    }
+
+    // Prepare MediaRecorder
+    const stream = canvas.captureStream(fps);
+    // if you want audio (TTS) inside the recorded file, we need to mix streams.
+    // We'll create an AudioContext and connect speechSynthesis via an <audio> element capture
+
+    // Create silent oscillator to enable audio track in some browsers (optional)
+    const mediaRecorder = new MediaRecorder(stream, {mimeType: 'video/webm;codecs=vp9'});
+    const chunks = [];
+    mediaRecorder.ondataavailable = e=>{ if(e.data.size) chunks.push(e.data); };
+    mediaRecorder.onstop = ()=>{
+      const blob = new Blob(chunks, {type: 'video/webm'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'ai-video.webm';
+      a.textContent = 'Download video (webm)';
+      downloadDiv.appendChild(a);
+      const v = document.createElement('video'); v.controls=true; v.src = url; v.style.maxWidth='100%';
+      downloadDiv.appendChild(document.createElement('br'));
+      downloadDiv.appendChild(v);
+      setStatus('Done. Video ready for download/playback.');
+    };
+
+    mediaRecorder.start();
+    setStatus('Recording...');
+    document.getElementById('stop').disabled = false;
+
+    // Play TTS and draw slides timed with durations.
+    const synth = window.speechSynthesis;
+    // Play each slide: draw -> speak -> wait duration
+    for(let i=0;i<lines.length;i++){
+      const text = lines[i];
+      const img = images[i] || null;
+      await drawSlide(text, img, sizeSel);
+      // small delay to allow frame to render
+      await wait(100);
+      // speak
+      if(synth){
+        const u = new SpeechSynthesisUtterance(text);
+        // optional: set voice, rate, pitch
+        u.rate = 1.0; u.pitch = 1.0; u.lang = 'en-US';
+        synth.speak(u);
+      }
+      // wait for duration seconds while frames are being recorded
+      await wait(duration*1000);
+    }
+
+    // stop recording
+    if(mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+    document.getElementById('stop').disabled = true;
+  });
+
+  document.getElementById('stop').addEventListener('click', ()=>{
+    // stop speech
+    window.speechSynthesis.cancel();
+    setStatus('Stopping...');
+    // stopping the recorder is handled in flow; here we just cancel audio
+  });
+
+  document.getElementById('preview').addEventListener('click', async ()=>{
+    const lines = document.getElementById('script').value.split('\n').map(s=>s.trim()).filter(Boolean);
+    if(lines.length===0){ setStatus('Please enter slides to preview'); return; }
+    const sizeSel = document.getElementById('width').value.split('x').map(Number);
+    canvas.width = sizeSel[0]; canvas.height = sizeSel[1];
+    const files = document.getElementById('images').files;
+    const images = [];
+    for(let i=0;i<files.length;i++){
+      try{ images.push(await fileToImage(files[i])); } catch(e){ }
+    }
+    setStatus('Previewing slides — no recording.');
+    for(let i=0;i<lines.length;i++){
+      drawSlide(lines[i], images[i]||null, sizeSel);
+      await wait(800);
+    }
+    setStatus('Preview finished.');
+  });
+
+  function wait(ms){ return new Promise(res=>setTimeout(res, ms)); }
+
+  // --- Hosting instructions (short) ---
+  // 1) Save this file as index.html
+  // 2) Create a new repo on GitHub and push this file
+  // 3) Connect the repo to Netlify (or drag & drop to Netlify) to deploy a static site
+  // 4) On Blogspot editor, switch to HTML view and paste the iframe snippet shown above.
+
+  setStatus('Ready. Type a script and click Generate.');
+  </script>
+</body>
+</html>
